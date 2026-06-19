@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -11,16 +12,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 import aiofiles
+import httpx
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Column,
     DateTime,
     Float,
-    Integer,
     String,
     Text,
     create_engine,
@@ -36,6 +37,12 @@ from .templates import (
     TemplateRecord,
     TemplateUpdateRequest,
 )
+
+
+MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024
+ALLOWED_EXT = {".mp3", ".wav", ".m4a"}
+WECHAT_WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "")
+VIEW_BASE_URL = os.environ.get("VIEW_BASE_URL", "http://localhost:8000")
 
 
 Base = declarative_base()
@@ -58,8 +65,11 @@ class MeetingORM(Base):
     meeting_type = Column(String(50), default="client_consultation")
     case_id = Column(String(200), nullable=True)
     case_match_status = Column(String(50), default="pending")
+    candidate_case_numbers = Column(Text, default="[]")
     participants = Column(Text, default="[]")
+    case_background = Column(Text, default="")
     audio_filename = Column(String(500), default="")
+    total_size_bytes = Column(Float, default=0.0)
     duration_seconds = Column(Float, default=0.0)
     transcript = Column(Text, default="")
     segments = Column(Text, default="[]")
@@ -71,6 +81,21 @@ class MeetingORM(Base):
 
 
 Base.metadata.create_all(bind=engine)
+try:
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE meetings ADD COLUMN case_background TEXT DEFAULT ''"))
+except Exception:
+    pass
+try:
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE meetings ADD COLUMN candidate_case_numbers TEXT DEFAULT '[]'"))
+except Exception:
+    pass
+try:
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE meetings ADD COLUMN total_size_bytes REAL DEFAULT 0.0"))
+except Exception:
+    pass
 
 template_manager = TemplateManager()
 
@@ -101,8 +126,11 @@ class MeetingResponse(BaseModel):
     meeting_type: str
     case_id: Optional[str] = None
     case_match_status: str = "pending"
+    candidate_case_numbers: list[str] = []
     participants: list[str] = []
+    case_background: str = ""
     audio_filename: str = ""
+    total_size_bytes: float = 0.0
     duration_seconds: float = 0.0
     state: str = "uploading"
     error_message: str = ""
@@ -115,11 +143,13 @@ class MeetingSummaryResponse(BaseModel):
     title: str
     meeting_type: str
     participants: list[str] = []
+    case_background: str = ""
     transcript: str = ""
     segments: list[dict[str, Any]] = []
     summary: dict[str, Any] = {}
     case_id: Optional[str] = None
     case_match_status: str = "pending"
+    candidate_case_numbers: list[str] = []
     created_at: str = ""
 
 
@@ -129,33 +159,46 @@ class SearchResponse(BaseModel):
 
 
 def _orm_to_response(m: MeetingORM) -> MeetingResponse:
+    try:
+        candidates = json.loads(m.candidate_case_numbers or "[]")
+    except Exception:
+        candidates = []
     return MeetingResponse(
         id=m.id,
         title=m.title,
         meeting_type=m.meeting_type,
         case_id=m.case_id,
         case_match_status=m.case_match_status,
-        participants=json.loads(m.participants),
+        candidate_case_numbers=candidates,
+        participants=json.loads(m.participants or "[]"),
+        case_background=m.case_background or "",
         audio_filename=m.audio_filename,
-        duration_seconds=m.duration_seconds,
+        total_size_bytes=m.total_size_bytes or 0,
+        duration_seconds=m.duration_seconds or 0,
         state=m.state,
-        error_message=m.error_message,
+        error_message=m.error_message or "",
         created_at=m.created_at.isoformat() if m.created_at else "",
         updated_at=m.updated_at.isoformat() if m.updated_at else "",
     )
 
 
 def _orm_to_summary(m: MeetingORM) -> MeetingSummaryResponse:
+    try:
+        candidates = json.loads(m.candidate_case_numbers or "[]")
+    except Exception:
+        candidates = []
     return MeetingSummaryResponse(
         id=m.id,
         title=m.title,
         meeting_type=m.meeting_type,
-        participants=json.loads(m.participants),
-        transcript=m.transcript,
-        segments=json.loads(m.segments),
-        summary=json.loads(m.summary),
+        participants=json.loads(m.participants or "[]"),
+        case_background=m.case_background or "",
+        transcript=m.transcript or "",
+        segments=json.loads(m.segments or "[]"),
+        summary=json.loads(m.summary or "{}"),
         case_id=m.case_id,
         case_match_status=m.case_match_status,
+        candidate_case_numbers=candidates,
         created_at=m.created_at.isoformat() if m.created_at else "",
     )
 
@@ -167,6 +210,13 @@ def _get_db() -> Session:
     except Exception:
         db.close()
         raise
+
+
+def _validate_audio_type(filename: str) -> str:
+    ext = Path(filename or "audio.wav").suffix.lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Allowed: {sorted(ALLOWED_EXT)}")
+    return ext
 
 
 def _broadcast_progress(task_id: str, progress: TaskProgress) -> None:
@@ -190,6 +240,31 @@ def _broadcast_progress(task_id: str, progress: TaskProgress) -> None:
         ws_list.remove(d)
 
 
+async def send_wechat_notify(meeting: MeetingORM, success: bool, error_message: str = "") -> None:
+    if not WECHAT_WEBHOOK_URL:
+        return
+    try:
+        case_info = meeting.case_id or (", ".join(json.loads(meeting.candidate_case_numbers or "[]")) if meeting.candidate_case_numbers else "待关联")
+        view_url = f"{VIEW_BASE_URL}/meeting/{meeting.id}"
+        status_text = "✅ 已生成" if success else "❌ 生成失败"
+        content_lines = [
+            f"**会议纪要{status_text}**",
+            f"> 会议标题：{meeting.title}",
+            f"> 案件编号：{case_info}",
+            f"> 查看链接：[点击查看纪要]({view_url})",
+        ]
+        if not success and error_message:
+            content_lines.append(f"> 失败原因：{error_message[:300]}")
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {"content": "\n".join(content_lines)},
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(WECHAT_WEBHOOK_URL, json=payload)
+    except Exception:
+        pass
+
+
 async def _process_task(meeting_id: str) -> None:
     db = _get_db()
     try:
@@ -211,6 +286,7 @@ async def _process_task(meeting_id: str) -> None:
             progress.state = "failed"
             progress.error = "Audio file not found"
             _broadcast_progress(meeting_id, progress)
+            await send_wechat_notify(meeting, False, meeting.error_message)
             return
 
         existing_cases = []
@@ -223,11 +299,12 @@ async def _process_task(meeting_id: str) -> None:
         def on_progress(p: TaskProgress) -> None:
             _broadcast_progress(meeting_id, p)
 
+        participants = json.loads(meeting.participants or "[]")
         result = await pipeline.run(
             audio_path=audio_path,
             meeting_type=MeetingType(meeting.meeting_type),
-            participants=json.loads(meeting.participants),
-            case_background=None,
+            participants=participants,
+            case_background=meeting.case_background or None,
             on_progress=on_progress,
             existing_cases=existing_cases,
         )
@@ -237,10 +314,11 @@ async def _process_task(meeting_id: str) -> None:
         meeting.summary = json.dumps(result["summary"], ensure_ascii=False)
         meeting.case_id = result["summary"].get("case_id")
         meeting.case_match_status = result["summary"].get("case_match_status", "pending")
+        meeting.candidate_case_numbers = json.dumps(result["summary"].get("candidate_case_numbers", []), ensure_ascii=False)
         meeting.state = "completed"
         meeting.updated_at = datetime.now()
 
-        total_dur = sum(s["end"] - s["start"] for s in result["segments"])
+        total_dur = sum(s["end"] - s["start"] for s in result["segments"]) if result["segments"] else 0
         meeting.duration_seconds = total_dur
 
         db.commit()
@@ -248,17 +326,21 @@ async def _process_task(meeting_id: str) -> None:
         progress.state = "completed"
         progress.transcribed_seconds = progress.total_seconds
         _broadcast_progress(meeting_id, progress)
+        await send_wechat_notify(meeting, True)
 
     except Exception as exc:
         db = _get_db()
         meeting = db.query(MeetingORM).filter(MeetingORM.id == meeting_id).first()
+        error_msg = str(exc)
         if meeting:
             meeting.state = "failed"
-            meeting.error_message = str(exc)
+            meeting.error_message = error_msg
             meeting.updated_at = datetime.now()
             db.commit()
-        progress = TaskProgress(task_id=meeting_id, state="failed", error=str(exc))
+        progress = TaskProgress(task_id=meeting_id, state="failed", error=error_msg)
         _broadcast_progress(meeting_id, progress)
+        if meeting:
+            await send_wechat_notify(meeting, False, error_msg)
     finally:
         db.close()
 
@@ -276,7 +358,7 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
 
 
-app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -293,27 +375,38 @@ async def upload_audio(
     title: str = "",
     meeting_type: str = "client_consultation",
     participants: str = "[]",
-    case_background: Optional[str] = None,
+    case_background: str = "",
 ):
-    allowed_ext = {".mp3", ".wav", ".m4a"}
-    ext = Path(file.filename or "audio.wav").suffix.lower()
-    if ext not in allowed_ext:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Allowed: {allowed_ext}")
-
-    meeting_id = str(uuid.uuid4())
-    filename = f"{meeting_id}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    ext = _validate_audio_type(file.filename)
 
     try:
         meeting_type_enum = MeetingType(meeting_type)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid meeting_type: {meeting_type}")
 
-    async with aiofiles.open(filepath, "wb") as f:
-        content = await file.read()
-        await f.write(content)
+    meeting_id = str(uuid.uuid4())
+    filename = f"{meeting_id}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
 
-    participants_list = json.loads(participants) if isinstance(participants, str) else participants
+    total_bytes = 0
+    async with aiofiles.open(filepath, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_FILE_SIZE_BYTES:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                raise HTTPException(status_code=400, detail=f"File too large. Max size: {MAX_FILE_SIZE_BYTES // (1024 * 1024)}MB")
+            await f.write(chunk)
+
+    try:
+        participants_list = json.loads(participants) if isinstance(participants, str) and participants else []
+    except (json.JSONDecodeError, TypeError):
+        participants_list = []
 
     db = _get_db()
     meeting = MeetingORM(
@@ -321,7 +414,9 @@ async def upload_audio(
         title=title or file.filename or "未命名会议",
         meeting_type=meeting_type_enum.value,
         participants=json.dumps(participants_list, ensure_ascii=False),
+        case_background=case_background or "",
         audio_filename=filename,
+        total_size_bytes=total_bytes,
         state="queued",
         created_at=datetime.now(),
         updated_at=datetime.now(),
@@ -339,27 +434,66 @@ async def upload_audio(
     return _orm_to_response(meeting)
 
 
+@app.get("/api/upload/chunks/{upload_id}")
+async def get_upload_status(upload_id: str):
+    chunk_dir = os.path.join(CHUNK_DIR, upload_id)
+    manifest_path = os.path.join(chunk_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    async with aiofiles.open(manifest_path, "r") as f:
+        manifest = json.loads(await f.read())
+
+    received_files: list[int] = []
+    if os.path.isdir(chunk_dir):
+        for name in os.listdir(chunk_dir):
+            if name.startswith("chunk_"):
+                try:
+                    received_files.append(int(name.replace("chunk_", "")))
+                except ValueError:
+                    pass
+
+    return {
+        "upload_id": upload_id,
+        "total_chunks": manifest.get("total_chunks", 0),
+        "received_chunks": sorted(manifest.get("received", [])),
+        "total_size_bytes": manifest.get("total_size_bytes", 0),
+        "filename": manifest.get("filename", ""),
+        "title": manifest.get("title", ""),
+        "meeting_type": manifest.get("meeting_type", ""),
+    }
+
+
 @app.post("/api/upload/chunk", response_model=dict)
 async def upload_chunk(
     file: UploadFile = File(...),
     upload_id: str = "",
     chunk_index: int = 0,
     total_chunks: int = 1,
+    total_size_bytes: int = 0,
     filename: str = "audio.wav",
     title: str = "",
     meeting_type: str = "client_consultation",
     participants: str = "[]",
+    case_background: str = "",
 ):
     if not upload_id:
         upload_id = str(uuid.uuid4())
 
+    ext = _validate_audio_type(filename)
+
+    if chunk_index < 0 or (total_chunks > 0 and chunk_index >= total_chunks):
+        raise HTTPException(status_code=400, detail="Invalid chunk_index")
+
+    if total_size_bytes and total_size_bytes > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail=f"Total file too large. Max size: {MAX_FILE_SIZE_BYTES // (1024 * 1024)}MB")
+
+    try:
+        meeting_type_enum = MeetingType(meeting_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid meeting_type: {meeting_type}")
+
     chunk_dir = os.path.join(CHUNK_DIR, upload_id)
     os.makedirs(chunk_dir, exist_ok=True)
-
-    chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_index:06d}")
-    async with aiofiles.open(chunk_path, "wb") as f:
-        content = await file.read()
-        await f.write(content)
 
     manifest_path = os.path.join(chunk_dir, "manifest.json")
     manifest: dict[str, Any] = {}
@@ -367,51 +501,101 @@ async def upload_chunk(
         async with aiofiles.open(manifest_path, "r") as f:
             manifest = json.loads(await f.read())
     else:
+        try:
+            participants_list = json.loads(participants) if participants else []
+        except (json.JSONDecodeError, TypeError):
+            participants_list = []
         manifest = {
             "upload_id": upload_id,
             "total_chunks": total_chunks,
             "received": [],
+            "total_size_bytes": total_size_bytes,
             "filename": filename,
+            "ext": ext,
             "title": title,
             "meeting_type": meeting_type,
-            "participants": participants,
+            "participants": json.dumps(participants_list, ensure_ascii=False) if isinstance(participants_list, list) else participants,
+            "case_background": case_background,
         }
 
+    chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_index:06d}")
+
+    if chunk_index in manifest.get("received", []):
+        if not os.path.exists(chunk_path):
+            async with aiofiles.open(chunk_path, "wb") as f:
+                content = await file.read()
+                await f.write(content)
+        async with aiofiles.open(manifest_path, "w") as f:
+            await f.write(json.dumps(manifest, ensure_ascii=False))
+        return {
+            "status": "partial",
+            "upload_id": upload_id,
+            "received_chunks": len(manifest.get("received", [])),
+            "total_chunks": manifest.get("total_chunks", total_chunks),
+            "duplicate": True,
+        }
+
+    async with aiofiles.open(chunk_path, "wb") as f:
+        content = await file.read()
+        await f.write(content)
+
+    manifest.setdefault("received", [])
     if chunk_index not in manifest["received"]:
         manifest["received"].append(chunk_index)
+    manifest["received"] = sorted(manifest["received"])
 
     async with aiofiles.open(manifest_path, "w") as f:
-        await f.write(json.dumps(manifest))
+        await f.write(json.dumps(manifest, ensure_ascii=False))
 
-    if len(manifest["received"]) >= total_chunks:
+    if len(manifest["received"]) >= manifest.get("total_chunks", total_chunks):
         meeting_id = str(uuid.uuid4())
-        ext = Path(filename).suffix.lower()
-        final_filename = f"{meeting_id}{ext}"
+        final_filename = f"{meeting_id}{manifest.get('ext', ext)}"
         final_path = os.path.join(UPLOAD_DIR, final_filename)
+        total_written = 0
 
         async with aiofiles.open(final_path, "wb") as outf:
-            for i in range(total_chunks):
+            for i in range(manifest["total_chunks"]):
                 cp = os.path.join(chunk_dir, f"chunk_{i:06d}")
+                if not os.path.exists(cp):
+                    try:
+                        os.remove(final_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(status_code=400, detail=f"Missing chunk {i}")
                 async with aiofiles.open(cp, "rb") as inf:
-                    await outf.write(await inf.read())
+                    data = await inf.read()
+                    total_written += len(data)
+                    await outf.write(data)
 
-        import shutil
+        if total_written > MAX_FILE_SIZE_BYTES:
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail=f"Total merged file too large. Max size: {MAX_FILE_SIZE_BYTES // (1024 * 1024)}MB")
+
         shutil.rmtree(chunk_dir, ignore_errors=True)
 
+        final_meeting_type = manifest.get("meeting_type", meeting_type)
         try:
-            meeting_type_enum = MeetingType(meeting_type)
+            final_meeting_type_enum = MeetingType(final_meeting_type)
         except ValueError:
-            meeting_type_enum = MeetingType.CLIENT_CONSULTATION
+            final_meeting_type_enum = MeetingType.CLIENT_CONSULTATION
 
-        participants_list = json.loads(participants) if isinstance(participants, str) else participants
+        try:
+            final_participants = json.loads(manifest.get("participants", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            final_participants = []
 
         db = _get_db()
         meeting = MeetingORM(
             id=meeting_id,
-            title=title or filename or "未命名会议",
-            meeting_type=meeting_type_enum.value,
-            participants=json.dumps(participants_list, ensure_ascii=False),
+            title=manifest.get("title") or filename or "未命名会议",
+            meeting_type=final_meeting_type_enum.value,
+            participants=json.dumps(final_participants, ensure_ascii=False),
+            case_background=manifest.get("case_background", "") or "",
             audio_filename=final_filename,
+            total_size_bytes=total_written,
             state="queued",
             created_at=datetime.now(),
             updated_at=datetime.now(),
@@ -426,9 +610,15 @@ async def upload_chunk(
         await task_queue.put(meeting_id)
         db.close()
 
-        return {"status": "complete", "meeting_id": meeting_id, "upload_id": upload_id}
+        return {"status": "complete", "meeting_id": meeting_id, "upload_id": upload_id, "total_size_bytes": total_written}
 
-    return {"status": "partial", "upload_id": upload_id, "received_chunks": len(manifest["received"]), "total_chunks": total_chunks}
+    return {
+        "status": "partial",
+        "upload_id": upload_id,
+        "received_chunks": len(manifest["received"]),
+        "total_chunks": manifest.get("total_chunks", total_chunks),
+        "duplicate": False,
+    }
 
 
 @app.get("/api/meeting/{meeting_id}", response_model=MeetingResponse)
@@ -468,7 +658,9 @@ async def search_meetings(
     query = db.query(MeetingORM)
 
     if case_id:
-        query = query.filter(MeetingORM.case_id == case_id)
+        query = query.filter(
+            (MeetingORM.case_id == case_id) | (MeetingORM.candidate_case_numbers.contains(case_id))
+        )
     if meeting_type:
         query = query.filter(MeetingORM.meeting_type == meeting_type)
     if date_from:
@@ -479,7 +671,10 @@ async def search_meetings(
         query = query.filter(MeetingORM.participants.contains(participant))
     if keyword:
         query = query.filter(
-            (MeetingORM.transcript.contains(keyword)) | (MeetingORM.summary.contains(keyword))
+            (MeetingORM.transcript.contains(keyword))
+            | (MeetingORM.summary.contains(keyword))
+            | (MeetingORM.title.contains(keyword))
+            | (MeetingORM.case_background.contains(keyword))
         )
 
     total = query.count()
@@ -500,18 +695,90 @@ async def search_in_meeting(meeting_id: str, keyword: str = Query(..., min_lengt
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
-    segments = json.loads(meeting.segments)
-    hits = []
+    segments = json.loads(meeting.segments or "[]")
+    summary_data = json.loads(meeting.summary or "{}")
+    kw = keyword.lower()
+
+    transcript_hits: list[dict[str, Any]] = []
     for seg in segments:
-        if keyword.lower() in seg.get("text", "").lower():
-            hits.append({
+        if kw in seg.get("text", "").lower():
+            transcript_hits.append({
+                "source": "transcript",
                 "start": seg["start"],
                 "end": seg["end"],
-                "text": seg["text"],
                 "speaker": seg.get("speaker", ""),
+                "text": seg["text"],
             })
 
-    return {"meeting_id": meeting_id, "keyword": keyword, "hits": hits, "total_hits": len(hits)}
+    summary_fields = [
+        ("topic", "会议主题"),
+        ("raw_summary", "纪要全文"),
+    ]
+    list_fields = [
+        ("todos", "待办事项", "item"),
+        ("client_demands", "客户诉求", None),
+        ("risk_alerts", "风险提示", None),
+        ("key_points", "关键讨论点", "content"),
+    ]
+
+    summary_hits: list[dict[str, Any]] = []
+
+    for key, label in summary_fields:
+        val = summary_data.get(key, "")
+        if isinstance(val, str) and kw in val.lower():
+            summary_hits.append({
+                "source": "summary",
+                "field": key,
+                "field_label": label,
+                "text": val,
+            })
+
+    for key, label, item_key in list_fields:
+        items = summary_data.get(key, [])
+        if not isinstance(items, list):
+            continue
+        for idx, it in enumerate(items):
+            if isinstance(it, dict):
+                text = it.get(item_key, "") if item_key else json.dumps(it, ensure_ascii=False)
+            else:
+                text = str(it)
+            if kw in text.lower():
+                summary_hits.append({
+                    "source": "summary",
+                    "field": key,
+                    "field_label": label,
+                    "index": idx,
+                    "text": text,
+                })
+
+    if isinstance(summary_data.get("raw_summary", ""), str):
+        raw = summary_data["raw_summary"]
+        lines = raw.split("\n")
+        for idx, line in enumerate(lines):
+            if kw in line.lower():
+                already = any(
+                    h.get("field") == "raw_summary" and h.get("text") == line.strip()
+                    for h in summary_hits
+                )
+                if not already and line.strip():
+                    summary_hits.append({
+                        "source": "summary",
+                        "field": "raw_summary",
+                        "field_label": "纪要原文",
+                        "line_index": idx,
+                        "text": line.strip(),
+                    })
+
+    all_hits = transcript_hits + summary_hits
+
+    return {
+        "meeting_id": meeting_id,
+        "keyword": keyword,
+        "hits": all_hits,
+        "total_hits": len(all_hits),
+        "transcript_hits": len(transcript_hits),
+        "summary_hits": len(summary_hits),
+    }
 
 
 @app.websocket("/ws/task/{task_id}")
@@ -540,7 +807,8 @@ async def websocket_task_progress(websocket: WebSocket, task_id: str):
         pass
     finally:
         if task_id in task_ws_connections:
-            task_ws_connections[task_id].remove(websocket)
+            if websocket in task_ws_connections[task_id]:
+                task_ws_connections[task_id].remove(websocket)
             if not task_ws_connections[task_id]:
                 del task_ws_connections[task_id]
 
@@ -556,27 +824,37 @@ async def export_word(meeting_id: str):
         raise HTTPException(status_code=400, detail="Meeting not completed yet")
 
     from docx import Document
-    from docx.shared import Pt, Inches
 
     doc = Document()
     doc.add_heading("会议纪要", level=0)
 
-    info_table = doc.add_table(rows=5, cols=2)
+    info_table = doc.add_table(rows=6, cols=2)
+    case_display = meeting.case_id
+    if not case_display and meeting.candidate_case_numbers:
+        try:
+            cands = json.loads(meeting.candidate_case_numbers)
+            case_display = "待关联（识别到：" + "、".join(cands) + "）"
+        except Exception:
+            case_display = "待关联"
+    if not case_display:
+        case_display = "待关联"
+
     info_data = [
         ("会议主题", meeting.title),
         ("会议类型", meeting.meeting_type),
-        ("参会人员", ", ".join(json.loads(meeting.participants))),
+        ("参会人员", ", ".join(json.loads(meeting.participants or "[]"))),
         ("会议时间", meeting.created_at.isoformat() if meeting.created_at else ""),
-        ("案件编号", meeting.case_id or "待关联"),
+        ("案件编号", case_display),
+        ("案件背景", meeting.case_background or "无"),
     ]
     for i, (label, value) in enumerate(info_data):
         info_table.rows[i].cells[0].text = label
         info_table.rows[i].cells[1].text = value
 
     doc.add_heading("转写文本", level=1)
-    doc.add_paragraph(meeting.transcript)
+    doc.add_paragraph(meeting.transcript or "")
 
-    summary_data = json.loads(meeting.summary)
+    summary_data = json.loads(meeting.summary or "{}")
     doc.add_heading("智能纪要", level=1)
     doc.add_paragraph(summary_data.get("raw_summary", ""))
 
@@ -585,7 +863,11 @@ async def export_word(meeting_id: str):
     out_path = os.path.join(export_dir, f"{meeting_id}.docx")
     doc.save(out_path)
 
-    return FileResponse(out_path, filename=f"{meeting.title or '会议纪要'}.docx", media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    return FileResponse(
+        out_path,
+        filename=f"{meeting.title or '会议纪要'}.docx",
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
 
 @app.get("/api/meeting/{meeting_id}/export/pdf")
@@ -598,7 +880,17 @@ async def export_pdf(meeting_id: str):
     if meeting.state != "completed":
         raise HTTPException(status_code=400, detail="Meeting not completed yet")
 
-    summary_data = json.loads(meeting.summary)
+    case_display = meeting.case_id
+    if not case_display and meeting.candidate_case_numbers:
+        try:
+            cands = json.loads(meeting.candidate_case_numbers)
+            case_display = "待关联（识别到：" + "、".join(cands) + "）"
+        except Exception:
+            case_display = "待关联"
+    if not case_display:
+        case_display = "待关联"
+
+    summary_data = json.loads(meeting.summary or "{}")
     html_content = f"""
     <html><head><meta charset="utf-8"><style>
     body {{ font-family: SimSun, serif; margin: 40px; }}
@@ -606,19 +898,21 @@ async def export_pdf(meeting_id: str):
     table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
     td, th {{ border: 1px solid #000; padding: 8px; }}
     h2 {{ border-bottom: 2px solid #333; padding-bottom: 5px; }}
+    pre {{ white-space: pre-wrap; }}
     </style></head><body>
     <h1>会议纪要</h1>
     <table>
     <tr><td><strong>会议主题</strong></td><td>{meeting.title}</td></tr>
     <tr><td><strong>会议类型</strong></td><td>{meeting.meeting_type}</td></tr>
-    <tr><td><strong>参会人员</strong></td><td>{', '.join(json.loads(meeting.participants))}</td></tr>
+    <tr><td><strong>参会人员</strong></td><td>{', '.join(json.loads(meeting.participants or '[]'))}</td></tr>
     <tr><td><strong>会议时间</strong></td><td>{meeting.created_at.isoformat() if meeting.created_at else ''}</td></tr>
-    <tr><td><strong>案件编号</strong></td><td>{meeting.case_id or '待关联'}</td></tr>
+    <tr><td><strong>案件编号</strong></td><td>{case_display}</td></tr>
+    <tr><td><strong>案件背景</strong></td><td>{meeting.case_background or '无'}</td></tr>
     </table>
     <h2>转写文本</h2>
-    <pre style="white-space: pre-wrap;">{meeting.transcript}</pre>
+    <pre>{meeting.transcript or ''}</pre>
     <h2>智能纪要</h2>
-    <pre style="white-space: pre-wrap;">{summary_data.get('raw_summary', '')}</pre>
+    <pre>{summary_data.get('raw_summary', '')}</pre>
     </body></html>
     """
 
@@ -656,7 +950,7 @@ async def update_meeting_transcript(meeting_id: str, transcript: str = "", summa
     if transcript:
         meeting.transcript = transcript
     if summary_raw:
-        current = json.loads(meeting.summary)
+        current = json.loads(meeting.summary or "{}")
         current["raw_summary"] = summary_raw
         meeting.summary = json.dumps(current, ensure_ascii=False)
     meeting.updated_at = datetime.now()
@@ -704,7 +998,12 @@ async def get_template_version(template_id: str, version: int):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "wechat_webhook_configured": bool(WECHAT_WEBHOOK_URL),
+        "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
+    }
 
 
 if __name__ == "__main__":

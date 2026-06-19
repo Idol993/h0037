@@ -54,6 +54,7 @@ class SummaryResult:
     raw_summary: str = ""
     case_id: Optional[str] = None
     case_match_status: str = "pending"
+    candidate_case_numbers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -284,7 +285,7 @@ def _extract_todos(text: str) -> list[TodoItem]:
     return items
 
 
-def match_case(summary_text: str, existing_cases: list[dict[str, str]]) -> tuple[Optional[str], str]:
+def match_case(summary_text: str, existing_cases: list[dict[str, str]]) -> tuple[Optional[str], str, list[str]]:
     case_pattern = re.compile(r"[（(]?\s*案号\s*[:：]?\s*([A-Za-z\u4e00-\u9fff\d\u3000-\u303f]+?)[）)]?(?:\s|[,，。.；;]|$)")
     mentions = case_pattern.findall(summary_text)
 
@@ -293,14 +294,16 @@ def match_case(summary_text: str, existing_cases: list[dict[str, str]]) -> tuple
         mentions = alt_pattern.findall(summary_text)
 
     if not mentions:
-        return None, "pending"
+        return None, "pending", []
 
-    for mention in mentions:
+    unique_mentions = list(dict.fromkeys(mentions))
+
+    for mention in unique_mentions:
         for case in existing_cases:
             if mention in case.get("case_number", "") or case.get("case_number", "") in mention:
-                return case["case_id"], "matched"
+                return case["case_id"], "matched", unique_mentions
 
-    return None, "unmatched"
+    return None, "unmatched", unique_mentions
 
 
 class Pipeline:
@@ -401,9 +404,10 @@ class Pipeline:
         )
 
         if existing_cases:
-            case_id, match_status = match_case(summary.raw_summary, existing_cases)
+            case_id, match_status, candidates = match_case(summary.raw_summary, existing_cases)
             summary.case_id = case_id
             summary.case_match_status = match_status
+            summary.candidate_case_numbers = candidates
 
         progress.state = "completed"
         if on_progress:
@@ -421,5 +425,6 @@ class Pipeline:
                 "raw_summary": summary.raw_summary,
                 "case_id": summary.case_id,
                 "case_match_status": summary.case_match_status,
+                "candidate_case_numbers": summary.candidate_case_numbers,
             },
         }
