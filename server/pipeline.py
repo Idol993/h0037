@@ -325,36 +325,59 @@ def _extract_todos(text: str) -> list[TodoItem]:
     return items
 
 
+def _normalize_case_number(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    text = text.replace("（", "(").replace("）", ")")
+    text = text.replace("〔", "(").replace("〕", ")")
+    return text
+
+
 def match_case(summary_text: str, existing_cases: list[dict[str, str]]) -> tuple[Optional[str], str, list[str]]:
-    mentions: list[str] = []
-
-    p1 = re.compile(r"[（(]?\s*案号\s*[:：]?\s*([（(]?\d{4}[）)][\u4e00-\u9fff\d]+号?)[）)]?(?:\s|[,，。.；;]|$)")
-    mentions.extend(p1.findall(summary_text))
-
-    p2 = re.compile(r"[（(](\d{4})[）)][京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]?[\d]+[\u4e00-\u9fff]*\d+号")
-    mentions.extend(p2.findall(summary_text))
-
-    p3 = re.compile(r"((?:20\d{2})[）)]?[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]?[\d]+[\u4e00-\u9fff]*\d+号)")
-    mentions.extend(p3.findall(summary_text))
-
-    p4 = re.compile(r"((?:20\d{2})\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日?\s*[^\s，。,;；]{2,20}号)")
-    mentions.extend(p4.findall(summary_text))
-
-    p5 = re.compile(r"[（(](\d{4}[）)][京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]\d+[^）)\s]{0,30}号)")
-    mentions.extend(p5.findall(summary_text))
-
-    if not mentions:
+    if not summary_text:
         return None, "pending", []
 
-    unique_mentions = list(dict.fromkeys(mentions))
+    patterns = [
+        re.compile(r"案号\s*[:：]?\s*[（(〔]?(\d{4}[）)〕]?[\u4e00-\u9fff\d]{2,30}号)[）)〕]?", re.IGNORECASE),
+        re.compile(r"[（(〔](\d{4})[）)〕]([京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]\d{1,6}[\u4e00-\u9fff]{0,6}\d{1,8}号)"),
+        re.compile(r"(\d{4}[年]?\s*[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]\d{1,6}[\u4e00-\u9fff]{0,6}\d{1,8}号)"),
+        re.compile(r"[（(〔](\d{4}[\u4e00-\u9fff\d]{2,40}号)[）)〕]"),
+        re.compile(r"((?:20\d{2})\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日?\s*[\u4e00-\u9fff\d]{2,20}号)"),
+    ]
 
-    for mention in unique_mentions:
+    raw_mentions: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(summary_text):
+            groups = match.groups()
+            if len(groups) == 2:
+                candidate = f"({groups[0]}){groups[1]}"
+            else:
+                candidate = groups[0]
+            if candidate and "号" in candidate:
+                raw_mentions.append(candidate.strip())
+
+    if not raw_mentions:
+        return None, "pending", []
+
+    normalized_map: dict[str, str] = {}
+    for raw in raw_mentions:
+        norm = _normalize_case_number(raw)
+        if norm and norm not in normalized_map:
+            normalized_map[norm] = raw
+
+    unique_normalized = list(normalized_map.keys())
+    display_names = [normalized_map[n] for n in unique_normalized]
+
+    for norm_candidate in unique_normalized:
         for case in existing_cases:
-            cn = case.get("case_number", "")
-            if mention in cn or cn in mention:
-                return case["case_id"], "matched", unique_mentions
+            norm_existing = _normalize_case_number(case.get("case_number", ""))
+            if norm_candidate == norm_existing:
+                return case["case_id"], "matched", display_names
+            if norm_existing and (norm_candidate in norm_existing or norm_existing in norm_candidate):
+                return case["case_id"], "matched", display_names
 
-    return None, "unmatched", unique_mentions
+    return None, "unmatched", display_names
 
 
 class Pipeline:

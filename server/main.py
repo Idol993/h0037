@@ -295,6 +295,15 @@ def _parse_participants(raw: str) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _normalize_case_number(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    text = text.replace("（", "(").replace("）", ")")
+    text = text.replace("〔", "(").replace("〕", ")")
+    return text
+
+
 def _broadcast_progress(task_id: str, progress: TaskProgress) -> None:
     task_progress_store[task_id] = progress
     ws_list = task_ws_connections.get(task_id, [])
@@ -327,17 +336,16 @@ async def send_wechat_notify(meeting: MeetingORM, success: bool, error_message: 
         risk_count = len(risks) if isinstance(risks, list) else 0
 
         case_id = meeting.case_id
+        is_matched = meeting.case_match_status == "matched" and meeting.case_id
         candidate_cases = json.loads(meeting.candidate_case_numbers or "[]")
-        if case_id:
-            case_info = case_id
+        if is_matched:
             case_timeline_url = f"{VIEW_BASE_URL}/case/{case_id}"
             case_line = f"> 案件编号：[{case_id}]({case_timeline_url})（案件时间线）"
         elif candidate_cases:
             case_info = "待关联（" + "、".join(candidate_cases) + "）"
             case_line = f"> 案件编号：{case_info}"
         else:
-            case_info = "待关联"
-            case_line = f"> 案件编号：{case_info}"
+            case_line = "> 案件编号：待关联"
 
         view_url = f"{VIEW_BASE_URL}/meeting/{meeting.id}"
         status_text = "✅ 已生成" if success else "❌ 生成失败"
@@ -463,7 +471,7 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
 
 
-app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -764,10 +772,6 @@ async def search_meetings(
     db = _get_db()
     query = db.query(MeetingORM)
 
-    if case_id:
-        query = query.filter(
-            (MeetingORM.case_id == case_id) | (MeetingORM.candidate_case_numbers.contains(case_id))
-        )
     if meeting_type:
         query = query.filter(MeetingORM.meeting_type == meeting_type)
     if date_from:
@@ -784,8 +788,28 @@ async def search_meetings(
             | (MeetingORM.case_background.contains(keyword))
         )
 
-    total = query.count()
-    results = query.order_by(MeetingORM.created_at.desc()).offset(skip).limit(limit).all()
+    all_meetings = query.order_by(MeetingORM.created_at.desc()).all()
+
+    if case_id:
+        norm_query = _normalize_case_number(case_id)
+        filtered: list[MeetingORM] = []
+        for m in all_meetings:
+            if m.case_match_status == "matched" and m.case_id:
+                if _normalize_case_number(m.case_id) == norm_query:
+                    filtered.append(m)
+            else:
+                try:
+                    cands = json.loads(m.candidate_case_numbers or "[]")
+                    for c in cands:
+                        if _normalize_case_number(c) == norm_query:
+                            filtered.append(m)
+                            break
+                except Exception:
+                    pass
+        all_meetings = filtered
+
+    total = len(all_meetings)
+    results = all_meetings[skip : skip + limit]
     db.close()
 
     return SearchResponse(
@@ -813,6 +837,7 @@ async def list_cases(
     meetings = query.order_by(MeetingORM.created_at.desc()).all()
 
     cases_dict: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "display_id": "",
         "meeting_count": 0,
         "completed_count": 0,
         "todo_count": 0,
@@ -823,25 +848,36 @@ async def list_cases(
     })
 
     for m in meetings:
-        case_ids: list[str] = []
-        if m.case_id and m.case_match_status == "matched":
-            case_ids.append(m.case_id)
-            cases_dict[m.case_id]["case_match_status"] = "matched"
-        if m.candidate_case_numbers:
-            try:
-                cands = json.loads(m.candidate_case_numbers)
-                for c in cands:
-                    if c and c not in case_ids:
-                        case_ids.append(c)
-                        if m.case_match_status == "unmatched":
-                            cases_dict[c]["case_match_status"] = "unmatched"
-            except Exception:
-                pass
+        is_matched = m.case_match_status == "matched" and m.case_id
 
-        if not case_ids:
-            case_ids.append("__unclassified__")
+        case_ids_for_this_meeting: list[str] = []
+        if is_matched:
+            norm_id = _normalize_case_number(m.case_id)
+            case_ids_for_this_meeting.append(norm_id)
+            cases_dict[norm_id]["display_id"] = m.case_id
+            cases_dict[norm_id]["case_match_status"] = "matched"
+        else:
+            if m.candidate_case_numbers:
+                try:
+                    cands = json.loads(m.candidate_case_numbers)
+                    for c in cands:
+                        if not c:
+                            continue
+                        norm_c = _normalize_case_number(c)
+                        if norm_c not in case_ids_for_this_meeting:
+                            case_ids_for_this_meeting.append(norm_c)
+                            if not cases_dict[norm_c]["display_id"]:
+                                cases_dict[norm_c]["display_id"] = c
+                            if m.case_match_status == "unmatched":
+                                cases_dict[norm_c]["case_match_status"] = "unmatched"
+                except Exception:
+                    pass
 
-        for cid in case_ids:
+        if not case_ids_for_this_meeting:
+            case_ids_for_this_meeting.append("__unclassified__")
+            cases_dict["__unclassified__"]["display_id"] = ""
+
+        for cid in case_ids_for_this_meeting:
             cases_dict[cid]["meeting_count"] += 1
             if m.state == "completed":
                 cases_dict[cid]["completed_count"] += 1
@@ -860,10 +896,9 @@ async def list_cases(
                 cases_dict[cid]["latest_meeting_title"] = m.title
 
     case_items: list[CaseSummaryItem] = []
-    for case_id_val, data in cases_dict.items():
-        display_id = "" if case_id_val == "__unclassified__" else case_id_val
+    for norm_id, data in cases_dict.items():
         case_items.append(CaseSummaryItem(
-            case_id=display_id,
+            case_id=data["display_id"],
             case_match_status=data["case_match_status"],
             meeting_count=data["meeting_count"],
             completed_count=data["completed_count"],
@@ -890,18 +925,34 @@ async def get_case_meetings(
     limit: int = Query(50, ge=1, le=200),
 ):
     db = _get_db()
-    query = db.query(MeetingORM).filter(
-        (MeetingORM.case_id == case_id) | (MeetingORM.candidate_case_numbers.contains(case_id))
-    )
+    query = db.query(MeetingORM)
 
     if meeting_type:
         query = query.filter(MeetingORM.meeting_type == meeting_type)
 
-    total = query.count()
-    meetings = query.order_by(MeetingORM.created_at.desc()).offset(skip).limit(limit).all()
+    norm_query = _normalize_case_number(case_id)
+    meetings = query.order_by(MeetingORM.created_at.desc()).all()
+
+    matched_meetings: list[MeetingORM] = []
+    for m in meetings:
+        if m.case_match_status == "matched" and m.case_id:
+            if _normalize_case_number(m.case_id) == norm_query:
+                matched_meetings.append(m)
+        else:
+            try:
+                cands = json.loads(m.candidate_case_numbers or "[]")
+                for c in cands:
+                    if _normalize_case_number(c) == norm_query:
+                        matched_meetings.append(m)
+                        break
+            except Exception:
+                pass
+
+    total = len(matched_meetings)
+    paged = matched_meetings[skip : skip + limit]
     db.close()
 
-    items = [_orm_to_case_meeting(m) for m in meetings]
+    items = [_orm_to_case_meeting(m) for m in paged]
     return CaseTimelineResponse(case_id=case_id, meetings=items, total=total)
 
 
@@ -1047,15 +1098,16 @@ async def export_word(meeting_id: str):
     doc.add_heading("会议纪要", level=0)
 
     info_table = doc.add_table(rows=6, cols=2)
-    case_display = meeting.case_id
-    if not case_display and meeting.candidate_case_numbers:
-        try:
-            cands = json.loads(meeting.candidate_case_numbers)
-            case_display = "待关联（识别到：" + "、".join(cands) + "）"
-        except Exception:
-            case_display = "待关联"
-    if not case_display:
+    if meeting.case_match_status == "matched" and meeting.case_id:
+        case_display = meeting.case_id
+    else:
         case_display = "待关联"
+        try:
+            cands = json.loads(meeting.candidate_case_numbers or "[]")
+            if cands:
+                case_display = "待关联（识别到：" + "、".join(cands) + "）"
+        except Exception:
+            pass
 
     info_data = [
         ("会议主题", meeting.title),
@@ -1098,15 +1150,16 @@ async def export_pdf(meeting_id: str):
     if meeting.state != "completed":
         raise HTTPException(status_code=400, detail="Meeting not completed yet")
 
-    case_display = meeting.case_id
-    if not case_display and meeting.candidate_case_numbers:
-        try:
-            cands = json.loads(meeting.candidate_case_numbers)
-            case_display = "待关联（识别到：" + "、".join(cands) + "）"
-        except Exception:
-            case_display = "待关联"
-    if not case_display:
+    if meeting.case_match_status == "matched" and meeting.case_id:
+        case_display = meeting.case_id
+    else:
         case_display = "待关联"
+        try:
+            cands = json.loads(meeting.candidate_case_numbers or "[]")
+            if cands:
+                case_display = "待关联（识别到：" + "、".join(cands) + "）"
+        except Exception:
+            pass
 
     summary_data = json.loads(meeting.summary or "{}")
     html_content = f"""
@@ -1220,7 +1273,7 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.3.0",
+        "version": "1.4.0",
         "wechat_webhook_configured": bool(WECHAT_WEBHOOK_URL),
         "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
         "view_base_url": VIEW_BASE_URL,
