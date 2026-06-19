@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
@@ -14,7 +15,7 @@ from typing import Any, Optional
 import aiofiles
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -158,6 +159,40 @@ class SearchResponse(BaseModel):
     total: int
 
 
+class CaseMeetingItem(BaseModel):
+    id: str
+    title: str
+    meeting_type: str
+    participants: list[str] = []
+    duration_seconds: float = 0.0
+    todo_count: int = 0
+    risk_count: int = 0
+    state: str = ""
+    created_at: str = ""
+
+
+class CaseTimelineResponse(BaseModel):
+    case_id: str
+    meetings: list[CaseMeetingItem]
+    total: int
+
+
+class CaseSummaryItem(BaseModel):
+    case_id: str
+    case_match_status: str
+    meeting_count: int = 0
+    completed_count: int = 0
+    todo_count: int = 0
+    risk_count: int = 0
+    latest_meeting_time: str = ""
+    latest_meeting_title: str = ""
+
+
+class CaseListResponse(BaseModel):
+    cases: list[CaseSummaryItem]
+    total: int
+
+
 def _orm_to_response(m: MeetingORM) -> MeetingResponse:
     try:
         candidates = json.loads(m.candidate_case_numbers or "[]")
@@ -203,6 +238,23 @@ def _orm_to_summary(m: MeetingORM) -> MeetingSummaryResponse:
     )
 
 
+def _orm_to_case_meeting(m: MeetingORM) -> CaseMeetingItem:
+    summary = json.loads(m.summary or "{}")
+    todos = summary.get("todos", [])
+    risks = summary.get("risk_alerts", [])
+    return CaseMeetingItem(
+        id=m.id,
+        title=m.title,
+        meeting_type=m.meeting_type,
+        participants=json.loads(m.participants or "[]"),
+        duration_seconds=m.duration_seconds or 0,
+        todo_count=len(todos) if isinstance(todos, list) else 0,
+        risk_count=len(risks) if isinstance(risks, list) else 0,
+        state=m.state,
+        created_at=m.created_at.isoformat() if m.created_at else "",
+    )
+
+
 def _get_db() -> Session:
     db = SessionLocal()
     try:
@@ -217,6 +269,18 @@ def _validate_audio_type(filename: str) -> str:
     if ext not in ALLOWED_EXT:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Allowed: {sorted(ALLOWED_EXT)}")
     return ext
+
+
+def _parse_participants(raw: str) -> list[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(x) for x in data]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def _broadcast_progress(task_id: str, progress: TaskProgress) -> None:
@@ -244,17 +308,45 @@ async def send_wechat_notify(meeting: MeetingORM, success: bool, error_message: 
     if not WECHAT_WEBHOOK_URL:
         return
     try:
-        case_info = meeting.case_id or (", ".join(json.loads(meeting.candidate_case_numbers or "[]")) if meeting.candidate_case_numbers else "待关联")
+        summary = json.loads(meeting.summary or "{}")
+        todos = summary.get("todos", [])
+        risks = summary.get("risk_alerts", [])
+        todo_count = len(todos) if isinstance(todos, list) else 0
+        risk_count = len(risks) if isinstance(risks, list) else 0
+
+        case_id = meeting.case_id
+        candidate_cases = json.loads(meeting.candidate_case_numbers or "[]")
+        if case_id:
+            case_info = case_id
+            case_timeline_url = f"{VIEW_BASE_URL}/case/{case_id}"
+            case_line = f"> 案件编号：[{case_id}]({case_timeline_url})（案件时间线）"
+        elif candidate_cases:
+            case_info = "待关联（" + "、".join(candidate_cases) + "）"
+            case_line = f"> 案件编号：{case_info}"
+        else:
+            case_info = "待关联"
+            case_line = f"> 案件编号：{case_info}"
+
         view_url = f"{VIEW_BASE_URL}/meeting/{meeting.id}"
         status_text = "✅ 已生成" if success else "❌ 生成失败"
         content_lines = [
             f"**会议纪要{status_text}**",
             f"> 会议标题：{meeting.title}",
-            f"> 案件编号：{case_info}",
-            f"> 查看链接：[点击查看纪要]({view_url})",
+            case_line,
+            f"> 查看纪要：[点击查看]({view_url})",
         ]
-        if not success and error_message:
-            content_lines.append(f"> 失败原因：{error_message[:300]}")
+
+        if success:
+            content_lines.append(f"> 待办事项：**{todo_count}** 条")
+            content_lines.append(f"> 风险提示：**{risk_count}** 条")
+            if meeting.duration_seconds:
+                mins = int(meeting.duration_seconds // 60)
+                secs = int(meeting.duration_seconds % 60)
+                content_lines.append(f"> 会议时长：{mins}分{secs}秒")
+        else:
+            content_lines.append(f"> 失败原因：{error_message[:200]}")
+            content_lines.append(f"> 会议ID：`{meeting.id}`（可用于后台重试/排查）")
+
         payload = {
             "msgtype": "markdown",
             "markdown": {"content": "\n".join(content_lines)},
@@ -314,7 +406,8 @@ async def _process_task(meeting_id: str) -> None:
         meeting.summary = json.dumps(result["summary"], ensure_ascii=False)
         meeting.case_id = result["summary"].get("case_id")
         meeting.case_match_status = result["summary"].get("case_match_status", "pending")
-        meeting.candidate_case_numbers = json.dumps(result["summary"].get("candidate_case_numbers", []), ensure_ascii=False)
+        candidates = result["summary"].get("candidate_case_numbers", [])
+        meeting.candidate_case_numbers = json.dumps(candidates, ensure_ascii=False)
         meeting.state = "completed"
         meeting.updated_at = datetime.now()
 
@@ -358,7 +451,7 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
 
 
-app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -372,10 +465,10 @@ app.add_middleware(
 @app.post("/api/upload", response_model=MeetingResponse)
 async def upload_audio(
     file: UploadFile = File(...),
-    title: str = "",
-    meeting_type: str = "client_consultation",
-    participants: str = "[]",
-    case_background: str = "",
+    title: str = Form(""),
+    meeting_type: str = Form("client_consultation"),
+    participants: str = Form("[]"),
+    case_background: str = Form(""),
 ):
     ext = _validate_audio_type(file.filename)
 
@@ -383,6 +476,8 @@ async def upload_audio(
         meeting_type_enum = MeetingType(meeting_type)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid meeting_type: {meeting_type}")
+
+    participants_list = _parse_participants(participants)
 
     meeting_id = str(uuid.uuid4())
     filename = f"{meeting_id}{ext}"
@@ -402,11 +497,6 @@ async def upload_audio(
                     pass
                 raise HTTPException(status_code=400, detail=f"File too large. Max size: {MAX_FILE_SIZE_BYTES // (1024 * 1024)}MB")
             await f.write(chunk)
-
-    try:
-        participants_list = json.loads(participants) if isinstance(participants, str) and participants else []
-    except (json.JSONDecodeError, TypeError):
-        participants_list = []
 
     db = _get_db()
     meeting = MeetingORM(
@@ -452,6 +542,11 @@ async def get_upload_status(upload_id: str):
                 except ValueError:
                     pass
 
+    try:
+        parts_list = json.loads(manifest.get("participants", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        parts_list = []
+
     return {
         "upload_id": upload_id,
         "total_chunks": manifest.get("total_chunks", 0),
@@ -460,21 +555,23 @@ async def get_upload_status(upload_id: str):
         "filename": manifest.get("filename", ""),
         "title": manifest.get("title", ""),
         "meeting_type": manifest.get("meeting_type", ""),
+        "participants": parts_list,
+        "case_background": manifest.get("case_background", ""),
     }
 
 
 @app.post("/api/upload/chunk", response_model=dict)
 async def upload_chunk(
     file: UploadFile = File(...),
-    upload_id: str = "",
-    chunk_index: int = 0,
-    total_chunks: int = 1,
-    total_size_bytes: int = 0,
-    filename: str = "audio.wav",
-    title: str = "",
-    meeting_type: str = "client_consultation",
-    participants: str = "[]",
-    case_background: str = "",
+    upload_id: str = Form(""),
+    chunk_index: int = Form(0),
+    total_chunks: int = Form(1),
+    total_size_bytes: int = Form(0),
+    filename: str = Form("audio.wav"),
+    title: str = Form(""),
+    meeting_type: str = Form("client_consultation"),
+    participants: str = Form("[]"),
+    case_background: str = Form(""),
 ):
     if not upload_id:
         upload_id = str(uuid.uuid4())
@@ -492,6 +589,8 @@ async def upload_chunk(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid meeting_type: {meeting_type}")
 
+    participants_list = _parse_participants(participants)
+
     chunk_dir = os.path.join(CHUNK_DIR, upload_id)
     os.makedirs(chunk_dir, exist_ok=True)
 
@@ -501,10 +600,6 @@ async def upload_chunk(
         async with aiofiles.open(manifest_path, "r") as f:
             manifest = json.loads(await f.read())
     else:
-        try:
-            participants_list = json.loads(participants) if participants else []
-        except (json.JSONDecodeError, TypeError):
-            participants_list = []
         manifest = {
             "upload_id": upload_id,
             "total_chunks": total_chunks,
@@ -513,8 +608,8 @@ async def upload_chunk(
             "filename": filename,
             "ext": ext,
             "title": title,
-            "meeting_type": meeting_type,
-            "participants": json.dumps(participants_list, ensure_ascii=False) if isinstance(participants_list, list) else participants,
+            "meeting_type": meeting_type_enum.value,
+            "participants": json.dumps(participants_list, ensure_ascii=False),
             "case_background": case_background,
         }
 
@@ -685,6 +780,122 @@ async def search_meetings(
         results=[_orm_to_summary(m) for m in results],
         total=total,
     )
+
+
+@app.get("/api/cases", response_model=CaseListResponse)
+async def list_cases(
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    db = _get_db()
+    query = db.query(MeetingORM).filter(MeetingORM.state == "completed")
+
+    if status == "matched":
+        query = query.filter(MeetingORM.case_match_status == "matched", MeetingORM.case_id.isnot(None))
+    elif status == "unmatched":
+        query = query.filter(MeetingORM.case_match_status == "unmatched")
+    elif status == "pending":
+        query = query.filter(MeetingORM.case_match_status == "pending")
+
+    meetings = query.order_by(MeetingORM.created_at.desc()).all()
+
+    cases_dict: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "meeting_count": 0,
+        "completed_count": 0,
+        "todo_count": 0,
+        "risk_count": 0,
+        "latest_meeting_time": None,
+        "latest_meeting_title": "",
+        "case_match_status": "pending",
+    })
+
+    for m in meetings:
+        case_ids: list[str] = []
+        if m.case_id and m.case_match_status == "matched":
+            case_ids.append(m.case_id)
+            key = m.case_id
+            cases_dict[key]["case_match_status"] = "matched"
+        if m.candidate_case_numbers:
+            try:
+                cands = json.loads(m.candidate_case_numbers)
+                for c in cands:
+                    if c and c not in case_ids:
+                        case_ids.append(c)
+            except Exception:
+                pass
+
+        if not case_ids:
+            case_ids.append("_pending_")
+
+        for cid in case_ids:
+            if cid == "_pending_":
+                continue
+            if cid == m.case_id and m.case_match_status == "matched":
+                cases_dict[cid]["case_match_status"] = "matched"
+            elif cases_dict[cid]["case_match_status"] == "pending" and m.case_match_status == "unmatched":
+                cases_dict[cid]["case_match_status"] = "unmatched"
+
+            cases_dict[cid]["meeting_count"] += 1
+            if m.state == "completed":
+                cases_dict[cid]["completed_count"] += 1
+
+            try:
+                summary = json.loads(m.summary or "{}")
+                todos = summary.get("todos", [])
+                risks = summary.get("risk_alerts", [])
+                cases_dict[cid]["todo_count"] += len(todos) if isinstance(todos, list) else 0
+                cases_dict[cid]["risk_count"] += len(risks) if isinstance(risks, list) else 0
+            except Exception:
+                pass
+
+            if cases_dict[cid]["latest_meeting_time"] is None or (m.created_at and m.created_at > cases_dict[cid]["latest_meeting_time"]):
+                cases_dict[cid]["latest_meeting_time"] = m.created_at
+                cases_dict[cid]["latest_meeting_title"] = m.title
+
+    case_items: list[CaseSummaryItem] = []
+    for case_id, data in cases_dict.items():
+        case_items.append(CaseSummaryItem(
+            case_id=case_id,
+            case_match_status=data["case_match_status"],
+            meeting_count=data["meeting_count"],
+            completed_count=data["completed_count"],
+            todo_count=data["todo_count"],
+            risk_count=data["risk_count"],
+            latest_meeting_time=data["latest_meeting_time"].isoformat() if data["latest_meeting_time"] else "",
+            latest_meeting_title=data["latest_meeting_title"],
+        ))
+
+    case_items.sort(key=lambda x: x.latest_meeting_time or "", reverse=True)
+
+    total = len(case_items)
+    paged = case_items[skip : skip + limit]
+    db.close()
+
+    return CaseListResponse(cases=paged, total=total)
+
+
+@app.get("/api/cases/{case_id}/meetings", response_model=CaseTimelineResponse)
+async def get_case_meetings(
+    case_id: str,
+    meeting_type: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    db = _get_db()
+    query = db.query(MeetingORM).filter(
+        (MeetingORM.case_id == case_id) | (MeetingORM.candidate_case_numbers.contains(case_id))
+    )
+
+    if meeting_type:
+        query = query.filter(MeetingORM.meeting_type == meeting_type)
+
+    total = query.count()
+    meetings = query.order_by(MeetingORM.created_at.desc()).offset(skip).limit(limit).all()
+    db.close()
+
+    items = [_orm_to_case_meeting(m) for m in meetings]
+    return CaseTimelineResponse(case_id=case_id, meetings=items, total=total)
 
 
 @app.get("/api/meeting/{meeting_id}/search")
@@ -1001,8 +1212,10 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
+        "version": "1.2.0",
         "wechat_webhook_configured": bool(WECHAT_WEBHOOK_URL),
         "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
+        "view_base_url": VIEW_BASE_URL,
     }
 
 
