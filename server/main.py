@@ -164,9 +164,13 @@ class CaseMeetingItem(BaseModel):
     title: str
     meeting_type: str
     participants: list[str] = []
+    case_background: str = ""
     duration_seconds: float = 0.0
     todo_count: int = 0
     risk_count: int = 0
+    candidate_case_numbers: list[str] = []
+    case_id: Optional[str] = None
+    case_match_status: str = "pending"
     state: str = ""
     created_at: str = ""
 
@@ -242,14 +246,22 @@ def _orm_to_case_meeting(m: MeetingORM) -> CaseMeetingItem:
     summary = json.loads(m.summary or "{}")
     todos = summary.get("todos", [])
     risks = summary.get("risk_alerts", [])
+    try:
+        candidates = json.loads(m.candidate_case_numbers or "[]")
+    except Exception:
+        candidates = []
     return CaseMeetingItem(
         id=m.id,
         title=m.title,
         meeting_type=m.meeting_type,
         participants=json.loads(m.participants or "[]"),
+        case_background=m.case_background or "",
         duration_seconds=m.duration_seconds or 0,
         todo_count=len(todos) if isinstance(todos, list) else 0,
         risk_count=len(risks) if isinstance(risks, list) else 0,
+        candidate_case_numbers=candidates,
+        case_id=m.case_id,
+        case_match_status=m.case_match_status,
         state=m.state,
         created_at=m.created_at.isoformat() if m.created_at else "",
     )
@@ -451,7 +463,7 @@ async def lifespan(app: FastAPI):
     worker_task.cancel()
 
 
-app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="会议录音转写与智能纪要生成API", version="1.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -560,7 +572,7 @@ async def get_upload_status(upload_id: str):
     }
 
 
-@app.post("/api/upload/chunk", response_model=dict)
+@app.post("/api/upload/chunk")
 async def upload_chunk(
     file: UploadFile = File(...),
     upload_id: str = Form(""),
@@ -705,7 +717,7 @@ async def upload_chunk(
         await task_queue.put(meeting_id)
         db.close()
 
-        return {"status": "complete", "meeting_id": meeting_id, "upload_id": upload_id, "total_size_bytes": total_written}
+        return _orm_to_response(meeting)
 
     return {
         "status": "partial",
@@ -814,28 +826,22 @@ async def list_cases(
         case_ids: list[str] = []
         if m.case_id and m.case_match_status == "matched":
             case_ids.append(m.case_id)
-            key = m.case_id
-            cases_dict[key]["case_match_status"] = "matched"
+            cases_dict[m.case_id]["case_match_status"] = "matched"
         if m.candidate_case_numbers:
             try:
                 cands = json.loads(m.candidate_case_numbers)
                 for c in cands:
                     if c and c not in case_ids:
                         case_ids.append(c)
+                        if m.case_match_status == "unmatched":
+                            cases_dict[c]["case_match_status"] = "unmatched"
             except Exception:
                 pass
 
         if not case_ids:
-            case_ids.append("_pending_")
+            case_ids.append("__unclassified__")
 
         for cid in case_ids:
-            if cid == "_pending_":
-                continue
-            if cid == m.case_id and m.case_match_status == "matched":
-                cases_dict[cid]["case_match_status"] = "matched"
-            elif cases_dict[cid]["case_match_status"] == "pending" and m.case_match_status == "unmatched":
-                cases_dict[cid]["case_match_status"] = "unmatched"
-
             cases_dict[cid]["meeting_count"] += 1
             if m.state == "completed":
                 cases_dict[cid]["completed_count"] += 1
@@ -854,9 +860,10 @@ async def list_cases(
                 cases_dict[cid]["latest_meeting_title"] = m.title
 
     case_items: list[CaseSummaryItem] = []
-    for case_id, data in cases_dict.items():
+    for case_id_val, data in cases_dict.items():
+        display_id = "" if case_id_val == "__unclassified__" else case_id_val
         case_items.append(CaseSummaryItem(
-            case_id=case_id,
+            case_id=display_id,
             case_match_status=data["case_match_status"],
             meeting_count=data["meeting_count"],
             completed_count=data["completed_count"],
@@ -1136,7 +1143,7 @@ async def export_pdf(meeting_id: str):
     return FileResponse(out_path, filename=f"{meeting.title or '会议纪要'}.pdf", media_type="application/pdf")
 
 
-@app.put("/api/meeting/{meeting_id}/case")
+@app.put("/api/meeting/{meeting_id}/case", response_model=MeetingResponse)
 async def update_meeting_case(meeting_id: str, case_id: str = "", case_match_status: str = "matched"):
     db = _get_db()
     meeting = db.query(MeetingORM).filter(MeetingORM.id == meeting_id).first()
@@ -1147,8 +1154,9 @@ async def update_meeting_case(meeting_id: str, case_id: str = "", case_match_sta
     meeting.case_match_status = case_match_status
     meeting.updated_at = datetime.now()
     db.commit()
+    resp = _orm_to_response(meeting)
     db.close()
-    return {"message": "Case updated", "meeting_id": meeting_id, "case_id": case_id}
+    return resp
 
 
 @app.put("/api/meeting/{meeting_id}/transcript")
@@ -1212,7 +1220,7 @@ async def health():
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.2.0",
+        "version": "1.3.0",
         "wechat_webhook_configured": bool(WECHAT_WEBHOOK_URL),
         "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
         "view_base_url": VIEW_BASE_URL,

@@ -237,10 +237,15 @@ def generate_summary(
 
 
 def _extract_field(text: str, header: str) -> Optional[str]:
-    pattern = rf"###\s*{re.escape(header)}\s*\n+(.*?)(?=\n###|\Z)"
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    patterns = [
+        rf"###\s*(?:[一二三四五六七八九十]+[、.]\s*)?{re.escape(header)}\s*\n+(.*?)(?=\n###|\Z)",
+        rf"##?\s*(?:[一二三四五六七八九十]+[、.]\s*)?{re.escape(header)}\s*\n+(.*?)(?=\n##?#\s|\Z)",
+        rf"\*\*{re.escape(header)}\*\*\s*\n+(.*?)(?=\n\*\*|\Z)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
     return None
 
 
@@ -248,7 +253,22 @@ def _extract_list_field(text: str, header: str) -> list[str]:
     content = _extract_field(text, header)
     if not content:
         return []
-    items = [line.strip().lstrip("0123456789.-) ") for line in content.split("\n") if line.strip()]
+    items: list[str] = []
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if cells and not all(c in {"序号", "事项", "负责人", "截止日期", "优先级", "备注", "-"} for c in cells):
+                if not all(set(c) <= {"-"} for c in cells):
+                    items.append(" ".join(cells))
+            continue
+        clean = line.lstrip("0123456789.-) \uff09\uff09")
+        if clean and not clean.startswith("-"):
+            items.append(clean)
+        elif clean.startswith("-"):
+            items.append(clean[1:].strip())
     return [item for item in items if item]
 
 
@@ -277,21 +297,51 @@ def _extract_todos(text: str) -> list[TodoItem]:
     items: list[TodoItem] = []
     for line in content.split("\n"):
         line = line.strip()
-        if line.startswith("|") or line.startswith("-") or not line:
+        if not line:
             continue
-        clean = re.sub(r"^\d+[\.\)]\s*", "", line)
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if not cells:
+                continue
+            if all(c in {"序号", "事项", "负责人", "截止日期", "优先级", "备注", "-"} for c in cells):
+                continue
+            if all(set(c) <= {"-"} for c in cells):
+                continue
+            item_text = cells[0] if len(cells) >= 1 else ""
+            assignee = cells[1] if len(cells) >= 2 else ""
+            deadline = cells[2] if len(cells) >= 3 else ""
+            if item_text:
+                items.append(TodoItem(item=item_text, assignee=assignee, deadline=deadline))
+            continue
+        if line.startswith("-"):
+            clean = line[1:].strip()
+            if clean:
+                items.append(TodoItem(item=clean))
+            continue
+        clean = re.sub(r"^[一二三四五六七八九十]+[、.]\s*", "", line)
+        clean = re.sub(r"^\d+[\.\)]\s*", "", clean).strip()
         if clean:
             items.append(TodoItem(item=clean))
     return items
 
 
 def match_case(summary_text: str, existing_cases: list[dict[str, str]]) -> tuple[Optional[str], str, list[str]]:
-    case_pattern = re.compile(r"[（(]?\s*案号\s*[:：]?\s*([A-Za-z\u4e00-\u9fff\d\u3000-\u303f]+?)[）)]?(?:\s|[,，。.；;]|$)")
-    mentions = case_pattern.findall(summary_text)
+    mentions: list[str] = []
 
-    if not mentions:
-        alt_pattern = re.compile(r"(?:20\d{2})\s*[年]\s*\d{1,2}\s*[月]\s*\d{1,2}\s*[日号]?\s*[A-Za-z]*\d+号?")
-        mentions = alt_pattern.findall(summary_text)
+    p1 = re.compile(r"[（(]?\s*案号\s*[:：]?\s*([（(]?\d{4}[）)][\u4e00-\u9fff\d]+号?)[）)]?(?:\s|[,，。.；;]|$)")
+    mentions.extend(p1.findall(summary_text))
+
+    p2 = re.compile(r"[（(](\d{4})[）)][京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]?[\d]+[\u4e00-\u9fff]*\d+号")
+    mentions.extend(p2.findall(summary_text))
+
+    p3 = re.compile(r"((?:20\d{2})[）)]?[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]?[\d]+[\u4e00-\u9fff]*\d+号)")
+    mentions.extend(p3.findall(summary_text))
+
+    p4 = re.compile(r"((?:20\d{2})\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日?\s*[^\s，。,;；]{2,20}号)")
+    mentions.extend(p4.findall(summary_text))
+
+    p5 = re.compile(r"[（(](\d{4}[）)][京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤川青藏琼宁]\d+[^）)\s]{0,30}号)")
+    mentions.extend(p5.findall(summary_text))
 
     if not mentions:
         return None, "pending", []
@@ -300,7 +350,8 @@ def match_case(summary_text: str, existing_cases: list[dict[str, str]]) -> tuple
 
     for mention in unique_mentions:
         for case in existing_cases:
-            if mention in case.get("case_number", "") or case.get("case_number", "") in mention:
+            cn = case.get("case_number", "")
+            if mention in cn or cn in mention:
                 return case["case_id"], "matched", unique_mentions
 
     return None, "unmatched", unique_mentions
@@ -403,11 +454,10 @@ class Pipeline:
             ),
         )
 
-        if existing_cases:
-            case_id, match_status, candidates = match_case(summary.raw_summary, existing_cases)
-            summary.case_id = case_id
-            summary.case_match_status = match_status
-            summary.candidate_case_numbers = candidates
+        case_id, match_status, candidates = match_case(summary.raw_summary, existing_cases or [])
+        summary.case_id = case_id
+        summary.case_match_status = match_status
+        summary.candidate_case_numbers = candidates
 
         progress.state = "completed"
         if on_progress:
